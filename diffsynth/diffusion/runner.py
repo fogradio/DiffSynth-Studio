@@ -59,8 +59,16 @@ def launch_training_task(
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        for local_step, data in enumerate(tqdm(dataloader), start=1):
             with accelerator.accumulate(model):
+                runtime_model = accelerator.unwrap_model(model)
+                if hasattr(runtime_model, "set_runtime_state"):
+                    runtime_model.set_runtime_state(
+                        epoch=epoch_id,
+                        local_step=local_step,
+                        global_step=model_logger.num_steps + 1,
+                        rank=accelerator.process_index,
+                    )
                 if dataset.load_from_cache:
                     loss = model({}, inputs=data)
                 else:

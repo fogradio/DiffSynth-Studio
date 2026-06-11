@@ -33,6 +33,65 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     return loss
 
 
+def FlowMatchSFTMistakeForcingLoss(
+    pipe: BasePipeline,
+    mistake_recorder=None,
+    mistake_capture=None,
+    mistake_metadata=None,
+    **inputs,
+):
+    if "lora" in inputs:
+        pipe.clear_lora(verbose=0)
+        pipe.load_lora(pipe.dit, state_dict=inputs["lora"], hotload=True, verbose=0)
+
+    max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
+    min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
+
+    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
+
+    noise = torch.randn_like(inputs["input_latents"]) * inputs.get("noise_scale", 1.0)
+    inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
+    training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
+
+    if "first_frame_latents" in inputs:
+        inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
+
+    models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+    noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep, mistake_capture=mistake_capture)
+
+    clean_prediction = pipe.scheduler.step(noise_pred, timestep, inputs["latents"], to_final=True)
+    velocity_residual = training_target - noise_pred
+
+    noise_pred_for_loss = noise_pred
+    training_target_for_loss = training_target
+    if "first_frame_latents" in inputs:
+        noise_pred_for_loss = noise_pred_for_loss[:, :, 1:]
+        training_target_for_loss = training_target_for_loss[:, :, 1:]
+
+    loss = torch.nn.functional.mse_loss(noise_pred_for_loss.float(), training_target_for_loss.float())
+    loss = loss * pipe.scheduler.training_weight(timestep)
+
+    if mistake_recorder is not None:
+        capture_payload = {} if mistake_capture is None else mistake_capture.finalize()
+        payload = {
+            "condition_embedding": inputs["context"],
+            "hidden_mean": capture_payload.get("hidden_mean"),
+            "selected_hidden_states": capture_payload.get("selected_hidden_states"),
+            "timestep": timestep,
+            "time_embedding": capture_payload.get("time_embedding"),
+            "clean_prediction": clean_prediction,
+            "velocity_residual": velocity_residual,
+        }
+        payload = {key: value for key, value in payload.items() if value is not None}
+        metadata = {} if mistake_metadata is None else mistake_metadata.copy()
+        metadata["loss"] = float(loss.detach().float().cpu().item())
+        metadata["timestep"] = float(timestep.detach().float().cpu().item())
+        mistake_recorder.write(payload, metadata)
+
+    return loss
+
+
 def FlowMatchSFTAudioVideoLoss(pipe: BasePipeline, **inputs):
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))

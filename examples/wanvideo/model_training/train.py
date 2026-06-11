@@ -1,8 +1,15 @@
-import torch, os, argparse, accelerate, warnings
+import torch, os, sys, argparse, accelerate, warnings
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
+try:
+    from .mistake_forcing import OmniWorldFrameSequenceOperator, OmniWorldManifestDataset, WanHiddenStateCapture, WanMistakeRecorder
+except ImportError:
+    from mistake_forcing import OmniWorldFrameSequenceOperator, OmniWorldManifestDataset, WanHiddenStateCapture, WanMistakeRecorder
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -24,6 +31,8 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        output_path=None,
+        mistake_selected_layers="3,11,19,29",
     ):
         super().__init__()
         # Warning
@@ -53,16 +62,39 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.fp8_models = fp8_models
         self.task = task
+        self.output_path = output_path
+        self.runtime_state = {"epoch": 0, "local_step": 0, "global_step": 0, "rank": 0}
+        self.mistake_selected_layers = tuple(int(layer) for layer in mistake_selected_layers.split(",") if layer != "")
+        self.mistake_recorder = None
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
             "sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
+            "sft:mistake_forcing": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTMistakeForcingLoss(
+                pipe,
+                mistake_recorder=self.get_or_create_mistake_recorder(),
+                **inputs_shared,
+                **inputs_posi,
+            ),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
+
+    def set_runtime_state(self, epoch, local_step, global_step, rank):
+        self.runtime_state = {
+            "epoch": int(epoch),
+            "local_step": int(local_step),
+            "global_step": int(global_step),
+            "rank": int(rank),
+        }
+
+    def get_or_create_mistake_recorder(self):
+        if self.mistake_recorder is None:
+            self.mistake_recorder = WanMistakeRecorder(self.output_path, self.runtime_state["rank"])
+        return self.mistake_recorder
         
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -102,6 +134,16 @@ class WanTrainingModule(DiffusionTrainingModule):
             "min_timestep_boundary": self.min_timestep_boundary,
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+        if self.task == "sft:mistake_forcing":
+            inputs_shared["mistake_capture"] = WanHiddenStateCapture(self.mistake_selected_layers)
+            inputs_shared["mistake_metadata"] = {
+                "sample_id": data.get("sample_id"),
+                "scene_id": data.get("scene_id"),
+                "epoch": self.runtime_state["epoch"],
+                "local_step": self.runtime_state["local_step"],
+                "global_step": self.runtime_state["global_step"],
+                "rank": self.runtime_state["rank"],
+            }
         return inputs_shared, inputs_posi, inputs_nega
     
     def forward(self, data, inputs=None):
@@ -123,6 +165,9 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable it if this model is a WanToDance global model.")
+    parser.add_argument("--omniworld_manifest_format", default=False, action="store_true", help="Whether the dataset metadata is OmniWorld frame-sequence manifest JSONL.")
+    parser.add_argument("--max_data_items", type=int, default=None, help="Maximum number of data items to read from metadata.")
+    parser.add_argument("--mistake_selected_layers", type=str, default="3,11,19,29", help="Comma-separated Wan block indices to save in mistake forcing mode.")
     return parser
 
 
@@ -133,28 +178,46 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
-    dataset = UnifiedDataset(
-        base_path=args.dataset_base_path,
-        metadata_path=args.dataset_metadata_path,
-        repeat=args.dataset_repeat,
-        data_file_keys=args.data_file_keys.split(","),
-        main_data_operator=UnifiedDataset.default_video_operator(
+    if args.omniworld_manifest_format:
+        raw_dataset = UnifiedDataset(
             base_path=args.dataset_base_path,
-            max_pixels=args.max_pixels,
-            height=args.height,
-            width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
-            num_frames=args.num_frames,
-            time_division_factor=4 if not args.framewise_decoding else 1,
-            time_division_remainder=1 if not args.framewise_decoding else 0,
-        ),
-        special_operator_map={
-            "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
-            "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
-            "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
-        }
-    )
+            metadata_path=args.dataset_metadata_path,
+            repeat=args.dataset_repeat,
+            data_file_keys=tuple(),
+            max_data_items=args.max_data_items,
+        )
+        dataset = OmniWorldManifestDataset(
+            raw_dataset,
+            OmniWorldFrameSequenceOperator(
+                base_path=args.dataset_base_path,
+                frame_processor=ImageCropAndResize(args.height, args.width, args.max_pixels, 16, 16),
+                num_frames=args.num_frames,
+            ),
+        )
+    else:
+        dataset = UnifiedDataset(
+            base_path=args.dataset_base_path,
+            metadata_path=args.dataset_metadata_path,
+            repeat=args.dataset_repeat,
+            data_file_keys=args.data_file_keys.split(","),
+            main_data_operator=UnifiedDataset.default_video_operator(
+                base_path=args.dataset_base_path,
+                max_pixels=args.max_pixels,
+                height=args.height,
+                width=args.width,
+                height_division_factor=16,
+                width_division_factor=16,
+                num_frames=args.num_frames,
+                time_division_factor=4 if not args.framewise_decoding else 1,
+                time_division_remainder=1 if not args.framewise_decoding else 0,
+            ),
+            special_operator_map={
+                "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
+                "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
+                "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
+            },
+            max_data_items=args.max_data_items,
+        )
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -178,6 +241,8 @@ if __name__ == "__main__":
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        output_path=args.output_path,
+        mistake_selected_layers=args.mistake_selected_layers,
     )
     model_logger = ModelLogger(
         args.output_path,
@@ -193,6 +258,7 @@ if __name__ == "__main__":
         "direct_distill:data_process": launch_data_process_task,
         "sft": launch_training_task,
         "sft:train": launch_training_task,
+        "sft:mistake_forcing": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
     }

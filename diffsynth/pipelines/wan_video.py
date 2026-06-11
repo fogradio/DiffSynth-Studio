@@ -1311,6 +1311,7 @@ def model_fn_wan_video(
     wantodance_fps: float = 30.0,
     music_feature = None,
     skip_9th_layer: bool = False,
+    mistake_capture = None,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1387,6 +1388,8 @@ def model_fn_wan_video(
     else:
         t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
         t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
+    if mistake_capture is not None:
+        mistake_capture.set_time_embedding(t)
     
     # Motion Controller
     if motion_bucket_id is not None and motion_controller is not None:
@@ -1579,6 +1582,8 @@ def model_fn_wan_video(
             # WanToDance
             if hasattr(dit, "wantodance_enable_music_inject") and dit.wantodance_enable_music_inject:
                 x = dit.wantodance_after_transformer_block(block_id, x)
+            if mistake_capture is not None:
+                mistake_capture.add(block_id, x)
         if tea_cache is not None:
             tea_cache.store(x)
             

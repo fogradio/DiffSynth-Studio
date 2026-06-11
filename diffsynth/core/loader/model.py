@@ -94,12 +94,16 @@ def load_model_with_disk_offload(model_class, path, config=None, torch_dtype=tor
 
 def get_init_context(torch_dtype, device):
     if is_deepspeed_zero3_enabled():
-        from transformers.modeling_utils import set_zero3_state
+        from transformers.integrations.deepspeed import deepspeed_config
         import deepspeed
         # Why do we use "deepspeed.zero.Init"?
         # Weight segmentation of the model can be performed on the CPU side
         # and loading the segmented weights onto the computing card
-        init_contexts = [deepspeed.zero.Init(remote_device=device, dtype=torch_dtype), set_zero3_state()]
+        zero3_config = deepspeed_config()
+        if zero3_config is not None:
+            init_contexts = [deepspeed.zero.Init(config_dict_or_path=zero3_config)]
+        else:
+            init_contexts = [deepspeed.zero.Init(remote_device=device, dtype=torch_dtype)]
     else:
         # Why do we use `skip_model_initialization`?
         # It skips the random initialization of model parameters,
