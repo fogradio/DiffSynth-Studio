@@ -76,3 +76,48 @@ def test_zero3_init_context_uses_transformers_deepspeed_config(monkeypatch):
     with init_contexts[0]:
         pass
     assert captured["kwargs"] == {"config_dict_or_path": deepspeed_config}
+
+
+def test_zero3_load_model_uses_transformers_modeling_utils_loader(monkeypatch):
+    loader_model = load_loader_model_module(monkeypatch)
+    captured = {}
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        def to(self, *args, **kwargs):
+            captured["to"] = {"args": args, "kwargs": kwargs}
+            return self
+
+    def fake_load_state_dict_into_model(model, state_dict, start_prefix, assign_to_params_buffers=False):
+        captured["loader"] = {
+            "model": model,
+            "state_dict": state_dict,
+            "start_prefix": start_prefix,
+            "assign_to_params_buffers": assign_to_params_buffers,
+        }
+        return []
+
+    monkeypatch.setattr(loader_model, "is_deepspeed_zero3_enabled", lambda: True)
+    monkeypatch.setattr(loader_model, "get_init_context", lambda torch_dtype, device: [])
+    monkeypatch.delattr("transformers.integrations.deepspeed._load_state_dict_into_zero3_model", raising=False)
+    fake_modeling_utils = types.ModuleType("transformers.modeling_utils")
+    fake_modeling_utils._load_state_dict_into_model = fake_load_state_dict_into_model
+    monkeypatch.setitem(sys.modules, "transformers.modeling_utils", fake_modeling_utils)
+
+    state_dict = {"weight": torch.ones(1)}
+    model = loader_model.load_model(
+        FakeModel,
+        path="unused.safetensors",
+        torch_dtype=torch.bfloat16,
+        device="cuda",
+        state_dict=state_dict,
+    )
+
+    assert captured["loader"]["model"] is model
+    assert captured["loader"]["state_dict"] == state_dict
+    assert captured["loader"]["start_prefix"] == ""
+    assert captured["loader"]["assign_to_params_buffers"] is False
+    assert captured["to"]["kwargs"] == {"dtype": torch.bfloat16, "device": "cuda"}

@@ -52,8 +52,7 @@ def load_model(model_class, path, config=None, torch_dtype=torch.bfloat16, devic
         # Because at this stage, model parameters are partitioned across multiple GPUs.
         # Loading them directly could lead to excessive GPU memory consumption.
         if is_deepspeed_zero3_enabled():
-            from transformers.integrations.deepspeed import _load_state_dict_into_zero3_model
-            _load_state_dict_into_zero3_model(model, state_dict)
+            _load_state_dict_into_zero3_model_compat(model, state_dict)
         else:
             model.load_state_dict(state_dict, assign=True)
         # Why do we call `to()`?
@@ -67,6 +66,17 @@ def load_model(model_class, path, config=None, torch_dtype=torch.bfloat16, devic
     if hasattr(model, "eval"):
         model = model.eval()
     return model
+
+
+def _load_state_dict_into_zero3_model_compat(model, state_dict):
+    try:
+        from transformers.integrations.deepspeed import _load_state_dict_into_zero3_model
+    except ImportError:
+        from transformers.modeling_utils import _load_state_dict_into_model
+
+        _load_state_dict_into_model(model, state_dict, "")
+    else:
+        _load_state_dict_into_zero3_model(model, state_dict)
 
 
 def load_model_with_disk_offload(model_class, path, config=None, torch_dtype=torch.bfloat16, device="cpu", state_dict_converter=None, module_map=None):
