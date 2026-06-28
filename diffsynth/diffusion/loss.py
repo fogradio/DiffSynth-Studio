@@ -47,7 +47,11 @@ def FlowMatchSFTMistakeForcingLoss(
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
 
-    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    presampled_timestep_id = inputs.get("presampled_timestep_id", None)
+    if presampled_timestep_id is not None:
+        timestep_id = presampled_timestep_id.cpu() if torch.is_tensor(presampled_timestep_id) else presampled_timestep_id
+    else:
+        timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
     timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
 
     noise = torch.randn_like(inputs["input_latents"]) * inputs.get("noise_scale", 1.0)
@@ -87,6 +91,8 @@ def FlowMatchSFTMistakeForcingLoss(
         metadata = {} if mistake_metadata is None else mistake_metadata.copy()
         metadata["loss"] = float(loss.detach().float().cpu().item())
         metadata["timestep"] = float(timestep.detach().float().cpu().item())
+        metadata["residual_norm_sq"] = float(velocity_residual.detach().float().pow(2).mean().cpu().item())
+        metadata["timestep_id"] = int(timestep_id.item()) if torch.is_tensor(timestep_id) else int(timestep_id)
         mistake_recorder.write(payload, metadata)
 
     return loss

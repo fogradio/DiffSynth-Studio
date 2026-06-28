@@ -13,8 +13,8 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
 
-MANIFEST_PATH="${OMNIWORLD_MANIFEST_PATH:-/mnt/workspace/hwzhang/tmp/worktrees/omniworld-longcat-manifest/manifests/omniworld_train_ti2v_tv2v_81f.jsonl}"
-DATA_ROOT="${OMNIWORLD_DATA_ROOT:-/mnt/workspace/hwzhang}"
+MANIFEST_PATH="${OMNIWORLD_MANIFEST_PATH:-/mnt/workspace/hwzhang/code/dataset/OmniWorld/manifests/omniworld_train_ti2v_81f.jsonl}"
+DATA_ROOT="${OMNIWORLD_DATA_ROOT:-/mnt/workspace/hwzhang/code/dataset/OmniWorld}"
 MODEL_ROOT="${WAN21_T2V_13B_MODEL_ROOT:-/mnt/workspace/common/models/Wan2.1-T2V-1.3B}"
 OUTPUT_PATH="${WAN21_OMNIWORLD_MISTAKE_OUTPUT:-/mnt/workspace/hwzhang/code/mistake_forcing/outputs/wan21_t2v_1_3b_omniworld_sft_mistake}"
 

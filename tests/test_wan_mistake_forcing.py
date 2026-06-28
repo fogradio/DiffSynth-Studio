@@ -1,4 +1,5 @@
 import json
+import re
 
 import torch
 from PIL import Image
@@ -47,6 +48,17 @@ def test_omniworld_operator_loads_video_and_prompt(tmp_path):
     assert item["video"][0].size == (832, 480)
     assert item["prompt"] == "prompt from json"
     assert item["sample_id"] == "omniworld/scene_a/000001_000081__ti2v"
+
+
+def test_omniworld_training_script_defaults_to_dataset_parent():
+    script_path = "examples/wanvideo/model_training/full/Wan2.1-T2V-1.3B-OmniWorld-MistakeForcing.sh"
+    with open(script_path, "r", encoding="utf-8") as file:
+        script = file.read()
+
+    match = re.search(r'DATA_ROOT="\$\{OMNIWORLD_DATA_ROOT:-(.*?)\}"', script)
+
+    assert match is not None
+    assert match.group(1) == "/mnt/workspace/hwzhang/code/dataset/OmniWorld"
 
 
 def test_hidden_state_capture_builds_mean_and_selected_layers():
