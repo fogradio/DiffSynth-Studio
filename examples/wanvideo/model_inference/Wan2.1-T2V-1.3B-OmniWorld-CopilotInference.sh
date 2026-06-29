@@ -20,7 +20,7 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 # ---- Prompts / base model ----
-PROMPTS_PATH="${WAN21_INFER_PROMPTS:-/projects_vol/gp_chuanxia.zheng/hwzhang/datasets/WISA-80K/data/sample_videos_10/sample_10.jsonl}"
+PROMPTS_PATH="${WAN21_INFER_PROMPTS:-/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/inference_prompts_phygenbench_top5.jsonl}"
 BASE_MODEL_ROOT="${WAN21_T2V_13B_MODEL_ROOT:-/projects_vol/gp_chuanxia.zheng/hwzhang/model/Wan2.1-T2V-1.3B}"
 #DIT_WEIGHTS="${WAN21_INFER_DIT_WEIGHTS:-/projects_vol/gp_chuanxia.zheng/hwzhang/model/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors}"
 DIT_WEIGHTS="${WAN21_INFER_DIT_WEIGHTS:-/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/outputs/wan21_t2v_1_3b_wisa_joint_copilot_v2/step-2500.safetensors}"
