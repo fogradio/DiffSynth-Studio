@@ -44,6 +44,7 @@ try:
     from .mistake_forcing import (
         OmniWorldFrameSequenceOperator,
         OmniWorldManifestDataset,
+        WanHiddenStateCapture,
     )
     from .wisa_dataset import (
         WISAManifestDataset,
@@ -55,6 +56,7 @@ except ImportError:
     from mistake_forcing import (  # type: ignore
         OmniWorldFrameSequenceOperator,
         OmniWorldManifestDataset,
+        WanHiddenStateCapture,
     )
     from wisa_dataset import (  # type: ignore
         WISAManifestDataset,
@@ -118,7 +120,9 @@ class InMemoryCopilotTrainer:
         if self.copilot_version == "v3":
             # selected_hidden_states from capture: (L, B, N, D) → v3 expects (B, L, N, D)
             shs = payload["selected_hidden_states"].detach()
-            if shs.dim() == 4 and shs.shape[0] != shs.shape[1]:
+            if shs.dim() == 4:
+                # Always transpose by contract; comparing axis sizes fails when
+                # batch size happens to equal the number of selected layers.
                 shs = shs.permute(1, 0, 2, 3).contiguous()
             pred = self.copilot(
                 clean_prediction, time_embedding, condition_embedding, shs
@@ -282,28 +286,93 @@ class JointWanCopilotModule(WanTrainingModule):
 
     # -- joint loss ------------------------------------------------------------
     def forward(self, data, inputs=None):
+        # collate_fn hands the raw list of samples through, so batch_size > 1
+        # arrives as a list[dict] and batch_size == 1 (or a cached-inputs step)
+        # as a single dict. Dispatch on that.
+        if isinstance(data, list):
+            if len(data) == 1:
+                return self._forward_single(data[0], inputs=inputs)
+            return self._forward_batched(data)
+        return self._forward_single(data, inputs=inputs)
+
+    def _forward_single(self, data, inputs=None):
         self._copilot_trainer.reset()
         loss = super().forward(data, inputs=inputs)
-        copilot_loss = self._copilot_trainer.last_loss
+        return self._combine_losses(loss)
 
+    def _forward_batched(self, batch_list):
+        """Real batched DiT forward without touching DiffSynth core.
+
+        ``pipe.units`` are preprocessing only (the DiT lives in the loss's
+        ``model_fn``), so VAE/T5 encoding is run per sample — reusing the proven
+        bs=1 path — and the resulting latents/context are stacked into [B, ...]
+        and pushed through ONE FlowMatchSFTMistakeForcingLoss call. That single
+        call is where the DiT (and the copilot head) actually run a batched
+        forward, which is what lifts single-GPU utilisation.
+        """
+        self._copilot_trainer.reset()
+        pipe = self.pipe
+
+        input_latents_list, context_list, prompt_list, sample_ids = [], [], [], []
+        template = None
+        for sample in batch_list:
+            inputs = self.get_pipeline_inputs(sample)
+            inputs = self.transfer_data_to_device(inputs, pipe.device, pipe.torch_dtype)
+            for unit in pipe.units:
+                inputs = pipe.unit_runner(unit, pipe, *inputs)
+            shared, posi, nega = inputs
+            if "input_latents" not in shared:
+                raise RuntimeError(
+                    "Batched joint training needs the VAE to produce "
+                    "input_latents (got none). batch_size > 1 does not support "
+                    "cached datasets or image-only inputs."
+                )
+            input_latents_list.append(shared["input_latents"])
+            context_list.append(posi["context"])
+            if "prompt" in posi:
+                prompt_list.append(posi["prompt"])
+            sample_ids.append(sample.get("sample_id"))
+            if template is None:
+                template = (shared, posi, nega)
+
+        shared, posi, nega = template
+        shared, posi = dict(shared), dict(posi)
+
+        # Frame count is constant (fixed_frames operator) so latents share T and
+        # context shares the tokenizer's fixed seq_len → a plain cat on dim 0.
+        shared["input_latents"] = torch.cat(input_latents_list, dim=0)
+        # Drop the stale bs=1 noise; the loss regenerates randn_like(input_latents).
+        shared.pop("latents", None)
+        posi["context"] = torch.cat(context_list, dim=0)
+        if prompt_list:
+            posi["prompt"] = prompt_list
+
+        # One capture for the whole batch: the single batched DiT forward
+        # accumulates [B, N, D] hidden states, so finalize() yields batched
+        # payloads the copilot head consumes in one shot.
+        shared["mistake_capture"] = WanHiddenStateCapture(self.mistake_selected_layers)
+        if "mistake_metadata" in shared:
+            meta = dict(shared["mistake_metadata"])
+            meta["sample_id"] = sample_ids
+            shared["mistake_metadata"] = meta
+
+        loss = self.task_to_loss[self.task](pipe, shared, posi, nega)
+        return self._combine_losses(loss)
+
+    def _combine_losses(self, loss):
+        copilot_loss = self._copilot_trainer.last_loss
         if self._fuse_copilot_into_loss:
-            # In fused mode the loss fn already returned
+            # Fused mode: the loss fn already returned
             #   MSE(noise_pred + scale * copilot_out, training_target),
-            # which updates BOTH the base DiT (via noise_pred) and the copilot
-            # (via copilot_out). We ALSO keep the original standalone copilot
-            # residual MSE term so the copilot retains its direct supervision;
-            # that extra term only adds gradient to the copilot (its target,
-            # velocity_residual, is detached and contains no DiT graph).
+            # updating BOTH the base DiT (via noise_pred) and the copilot (via
+            # copilot_out). The standalone copilot residual MSE is kept on top so
+            # the copilot keeps its direct supervision; its target
+            # (velocity_residual) is detached, so that term adds gradient to the
+            # copilot only. last_dit_loss logs the DiT-only term the loss stashed.
             dit_only = self._copilot_trainer.last_dit_only_loss
             self.last_dit_loss = dit_only if torch.is_tensor(dit_only) else None
-            self.last_copilot_loss = (
-                copilot_loss.detach() if torch.is_tensor(copilot_loss) else None
-            )
-            if copilot_loss is None:
-                return loss
-            return loss + self.copilot_loss_weight * copilot_loss
-
-        self.last_dit_loss = loss.detach() if torch.is_tensor(loss) else None
+        else:
+            self.last_dit_loss = loss.detach() if torch.is_tensor(loss) else None
         self.last_copilot_loss = (
             copilot_loss.detach() if torch.is_tensor(copilot_loss) else None
         )
@@ -343,8 +412,12 @@ def launch_joint_training(accelerator, dataset, model, model_logger, args):
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(
         dataset,
+        batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=lambda x: x[0],
+        # Hand the raw list of samples to model.forward, which dispatches to the
+        # single- or batched-forward path. The default collate would try to
+        # stack PIL frame lists / prompt strings and fail.
+        collate_fn=lambda samples: samples,
         num_workers=args.dataset_num_workers,
     )
 
@@ -384,7 +457,7 @@ def launch_joint_training(accelerator, dataset, model, model_logger, args):
                             rank=accelerator.process_index,
                         )
                     if dataset.load_from_cache:
-                        loss = model({}, inputs=data)
+                        loss = model({}, inputs=data[0])
                     else:
                         loss = model(data)
                     accelerator.backward(loss)
@@ -519,6 +592,16 @@ def launch_joint_training(accelerator, dataset, model, model_logger, args):
 
 def joint_parser() -> argparse.ArgumentParser:
     parser = wan_parser()
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Per-GPU training batch size. >1 runs a real batched DiT forward "
+        "(per-sample VAE/T5 outputs are stacked). Needs a constant frame count, "
+        "so the WISA operator switches to fixed-frame sampling automatically "
+        "when batch_size > 1. Effective batch = batch_size * "
+        "gradient_accumulation_steps * num_processes.",
+    )
     parser.add_argument(
         "--copilot_dir",
         type=str,
@@ -661,6 +744,8 @@ def main():
         raise ValueError(
             "--wisa_manifest_format and --omniworld_manifest_format are mutually exclusive."
         )
+    if args.batch_size < 1:
+        raise ValueError(f"--batch_size must be >= 1, got {args.batch_size}.")
 
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -692,6 +777,7 @@ def main():
                 ),
                 max_frames=args.num_frames,
                 prompt_level=args.wisa_prompt_level,
+                fixed_frames=args.batch_size > 1,
             ),
         )
     else:
@@ -704,6 +790,12 @@ def main():
                 ),
                 num_frames=args.num_frames,
             ),
+        )
+
+    if args.batch_size > 1 and dataset.load_from_cache:
+        raise ValueError(
+            "batch_size > 1 is not supported with cached datasets "
+            "(load_from_cache=True). Use batch_size=1 or disable the dataset cache."
         )
 
     model = JointWanCopilotModule(

@@ -2,16 +2,15 @@
 
 Design constraints (agreed with the user, see also WISA-80K_使用说明.md):
 
-  * Frame count is *not* fixed across batches. Each clip yields
+  * By default, each clip yields
     ``num_frames = align_4k1(min(max_frames, total_frames))`` so it satisfies
     Wan's ``4k+1`` (VAE 4x temporal compression) requirement and caps at 81
-    frames (~5s @ 16fps). No padding is ever produced.
+    frames (~5s @ 16fps). In fixed-frame mode (used for batch_size > 1), short
+    clips repeat sampled timestamps so every sample has the same frame count.
   * Frames uniformly cover the *whole* clip via ``round(linspace(0, N-1, n))``.
-    Because ``num_frames <= total_frames`` the step ``(N-1)/(n-1) >= 1``, so the
-    sampled indices are strictly increasing — sparse for long clips, dense for
-    short ones, never repeating. This keeps the full physical process in view
-    (critical for WISA) instead of only the first 5s, and is what "sparse
-    sampling, no padding" means here.
+    In the default mode, indices are strictly increasing; fixed-frame mode may
+    repeat indices for short clips. Both modes keep the full physical process
+    in view (critical for WISA) instead of only the first 5s.
   * Prompt = ``captions`` + ``phys_law`` (physical-consistency level "B").
   * Spatial size is unified to (height, width) by ``ImageCropAndResize``.
 """
@@ -77,6 +76,7 @@ class WISAVideoOperator:
         time_division_factor=4,
         time_division_remainder=1,
         prompt_level="B",
+        fixed_frames=False,
     ):
         self.name2path = name2path
         self.frame_processor = frame_processor
@@ -84,6 +84,13 @@ class WISAVideoOperator:
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         self.prompt_level = prompt_level
+        # When True every clip yields a CONSTANT align_4k1(max_frames) count so
+        # samples can be stacked into one [B, C, T, H, W] batch (single-GPU
+        # batch_size > 1). Clips longer than the target stay full-span sparse;
+        # clips shorter than it reuse frames via round(linspace) — i.e. some
+        # timestamps freeze (中间静默 padding) instead of dropping the sample
+        # or zero-padding the tensor.
+        self.fixed_frames = fixed_frames
 
     def _resolve_path(self, item):
         path = item.get("video_path") or self.name2path.get(item["video_name"])
@@ -94,11 +101,21 @@ class WISAVideoOperator:
         return path
 
     def _sample_indices(self, total_frames):
-        num_frames = align_frame_count(
-            min(self.max_frames, total_frames),
-            self.time_division_factor,
-            self.time_division_remainder,
-        )
+        if self.fixed_frames:
+            # Constant length across clips (batched training). Do NOT min() with
+            # total_frames: short clips repeat frames via the round(linspace)
+            # below rather than yielding a smaller tensor.
+            num_frames = align_frame_count(
+                self.max_frames,
+                self.time_division_factor,
+                self.time_division_remainder,
+            )
+        else:
+            num_frames = align_frame_count(
+                min(self.max_frames, total_frames),
+                self.time_division_factor,
+                self.time_division_remainder,
+            )
         if num_frames <= 1:
             return [0]
         step = (total_frames - 1) / (num_frames - 1)
