@@ -221,6 +221,14 @@ def load_prompts(prompts_path: str) -> list[dict]:
     return records
 
 
+def coerce_prompt_text(prompt) -> str:
+    # Prompt values may be a dict (e.g. PhyGenBench entries kept un-split); the
+    # pipeline only accepts a string, so serialize non-str prompts to JSON.
+    if isinstance(prompt, str):
+        return prompt
+    return json.dumps(prompt, ensure_ascii=False)
+
+
 def build_output_dir(output_root: str, tag: str) -> Path:
     timestamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(output_root) / f"{timestamp}_{tag}"
@@ -475,7 +483,7 @@ def main() -> None:
     }
 
     for idx, rec in enumerate(prompts):
-        prompt = rec["prompt"]
+        prompt = coerce_prompt_text(rec["prompt"])
         sample_id = rec.get("sample_id", f"prompt_{idx:03d}")
         safe_id = sample_id.replace("/", "_")
         video_name = f"{idx:02d}_{safe_id}.mp4"

@@ -2,11 +2,15 @@
 #
 # Wan2.1 T2V-1.3B joint-copilot SFT on WISA-80K (balanced_1k).
 #
-# 2-GPU data parallel (pure DDP, NO DeepSpeed) on NTU HPCC GaaS H200.
-# This is a GPU job — submit it to a compute node, e.g.:
+# Single-GPU (no DDP) on NTU HPCC GaaS H200.
+# Submit to a compute node, e.g.:
 #   qsub -I -P gs_ccds_chuanxia.zheng -q gpu_as \
-#        -l select=1:ncpus=8:ngpus=2 -l walltime=12:00:00
-#   bash examples/wanvideo/model_training/full/Wan2.1-T2V-1.3B-WISA-Joint-Copilot.sh
+#        -l select=1:ncpus=4:ngpus=1 -l walltime=12:00:00
+#   bash examples/wanvideo/model_training/full/Wan2.1-T2V-1.3B-WISA-Joint-Copilot-1GPU.sh
+#
+# Or with the free-tier quota (max 30 min, for smoke test):
+#   qsub -I -P fs_ccds_chuanxia.zheng -q gpu_free \
+#        -l select=1:ncpus=4:ngpus=1 -l walltime=00:30:00
 #
 # Text  = captions + phys_law (prompt level B).
 # Video = unified 480x832; per-clip num_frames is DYNAMIC:
@@ -26,9 +30,8 @@ ACCELERATE_BIN="${ACCELERATE_BIN:-/home/hzhang093/.conda/envs/videogen/bin/accel
 
 cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-# 2-GPU data parallel.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
-NUM_PROCESSES="${NUM_PROCESSES:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+NUM_PROCESSES="${NUM_PROCESSES:-1}"
 
 # ===== WISA-80K T2V dataset =====
 WISA_DATA_ROOT="${WISA_DATA_ROOT:-/projects_vol/gp_chuanxia.zheng/hwzhang/datasets/WISA-80K/data}"
@@ -39,24 +42,21 @@ WISA_PROMPT_LEVEL="${WISA_PROMPT_LEVEL:-B}"
 # ===== Base model (DiffSynth-native Wan2.1-T2V-1.3B) =====
 MODEL_ROOT="${MODEL_ROOT:-/projects_vol/gp_chuanxia.zheng/hwzhang/model/Wan2.1-T2V-1.3B}"
 _TIMESTAMP="${_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-OUTPUT_PATH="${OUTPUT_PATH:-/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/outputs/wan21_t2v_1_3b_wisa_joint_copilot_${_TIMESTAMP}}"
+OUTPUT_PATH="${OUTPUT_PATH:-/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/outputs/wan21_t2v_1_3b_wisa_joint_copilot_1gpu_${_TIMESTAMP}}"
 
 HEIGHT="${HEIGHT:-480}"
 WIDTH="${WIDTH:-832}"
-# NUM_FRAMES is the CAP (max frames), not a fixed length. Each clip uses
-# align_4k1(min(NUM_FRAMES, total_frames)); no padding.
 NUM_FRAMES="${NUM_FRAMES:-81}"
 DATASET_REPEAT="${DATASET_REPEAT:-1}"
 DATASET_NUM_WORKERS="${DATASET_NUM_WORKERS:-4}"
 NUM_EPOCHS="${NUM_EPOCHS:-5}"
 DIT_LR="${DIT_LR:-5e-6}"
-# Save DiT + copilot every 500 global steps. Set SAVE_STEPS="" for per-epoch.
 SAVE_STEPS="${SAVE_STEPS:-500}"
 LOG_EVERY="${LOG_EVERY:-1}"
 MISTAKE_SELECTED_LAYERS="${MISTAKE_SELECTED_LAYERS:-3,11,19,29}"
 
 # ===== Copilot =====
-COPILOT_VERSION="${COPILOT_VERSION:-v2}"
+COPILOT_VERSION="${COPILOT_VERSION:-v3}"
 COPILOT_DIR="${COPILOT_DIR:-/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/video_copilot}"
 COPILOT_DIM="${COPILOT_DIM:-1024}"
 COPILOT_DEPTH="${COPILOT_DEPTH:-10}"
@@ -64,26 +64,12 @@ COPILOT_NUM_HEADS="${COPILOT_NUM_HEADS:-16}"
 COPILOT_MLP_RATIO="${COPILOT_MLP_RATIO:-4.0}"
 COPILOT_LR="${COPILOT_LR:-1e-4}"
 COPILOT_LOSS_WEIGHT="${COPILOT_LOSS_WEIGHT:-1.0}"
-# 0 = no epoch-end copilot save (already saved every SAVE_STEPS).
 SAVE_COPILOT_EVERY_EPOCH="${SAVE_COPILOT_EVERY_EPOCH:-0}"
 COPILOT_RESUME="${COPILOT_RESUME:-}"
 
-# ===== Fused copilot->DiT loss (new mode, default off) =====
-# When FUSE_COPILOT_INTO_DIT_LOSS=1, training optimizes
-#   total = MSE(noise_pred + COPILOT_FUSE_SCALE * copilot_out, target)        # fused term
-#         + COPILOT_LOSS_WEIGHT * MSE(copilot_out, velocity_residual)         # kept copilot term
-# The fused term updates BOTH the base DiT and the copilot (mirrors the
-# inference-time copilot correction); the kept residual term adds extra
-# gradient to the copilot only. When 0, the original loss (separate DiT MSE
-# + detached copilot MSE) is used.
-# Tip: set COPILOT_RESUME to warm-start from a trained copilot.
-FUSE_COPILOT_INTO_DIT_LOSS="${FUSE_COPILOT_INTO_DIT_LOSS:-1}"
-COPILOT_FUSE_SCALE="${COPILOT_FUSE_SCALE:-1.0}"
-
-# Optional cap; leave unset to use all 1000 balanced_1k items.
 MAX_DATA_ITEMS="${MAX_DATA_ITEMS:-}"
 
-# ===== Optimal Gap Sampling (default off, same as OmniWorld script) =====
+# ===== Optimal Gap Sampling (default off) =====
 OPTIMAL_GAP_SAMPLING="${OPTIMAL_GAP_SAMPLING:-0}"
 OGS_NUM_BINS="${OGS_NUM_BINS:-50}"
 OGS_WARMUP_STEPS="${OGS_WARMUP_STEPS:-200}"
@@ -132,10 +118,6 @@ fi
 if [[ -n "${COPILOT_RESUME}" ]]; then
   EXTRA_ARGS+=(--copilot_resume "${COPILOT_RESUME}")
 fi
-if [[ "${FUSE_COPILOT_INTO_DIT_LOSS}" == "1" ]]; then
-  EXTRA_ARGS+=(--fuse_copilot_into_dit_loss)
-  EXTRA_ARGS+=(--copilot_fuse_scale "${COPILOT_FUSE_SCALE}")
-fi
 if [[ -n "${RESUME_FROM_CHECKPOINT:-}" ]]; then
   EXTRA_ARGS+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
@@ -148,7 +130,7 @@ if [[ "${OPTIMAL_GAP_SAMPLING}" == "1" ]]; then
 fi
 
 "${ACCELERATE_BIN}" launch \
-  --config_file "${PROJECT_ROOT}/examples/wanvideo/model_training/full/accelerate_config_ddp_2gpu.yaml" \
+  --config_file "${PROJECT_ROOT}/examples/wanvideo/model_training/full/accelerate_config_1gpu.yaml" \
   --num_processes "${NUM_PROCESSES}" \
   examples/wanvideo/model_training/train_joint_copilot.py \
   --wisa_manifest_format \

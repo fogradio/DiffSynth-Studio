@@ -95,6 +95,29 @@ def FlowMatchSFTMistakeForcingLoss(
         metadata["timestep_id"] = int(timestep_id.item()) if torch.is_tensor(timestep_id) else int(timestep_id)
         mistake_recorder.write(payload, metadata)
 
+        # Fused mode: instead of supervising the bare DiT velocity, supervise the
+        # SUM (noise_pred + scale * copilot_out) against the training target, so
+        # that the base DiT loss "sees" the copilot correction (mirrors the
+        # inference-time fusion). Gradients flow into the DiT via noise_pred and
+        # into the copilot via copilot_out (its inputs were detached in write(),
+        # so no copilot gradient leaks back into the DiT).
+        if getattr(mistake_recorder, "fuse_copilot_into_loss", False):
+            copilot_out = getattr(mistake_recorder, "last_copilot_output", None)
+            if copilot_out is None:
+                raise RuntimeError(
+                    "fuse_copilot_into_loss is enabled but the recorder produced "
+                    "no copilot output (is mistake_capture active?)."
+                )
+            fuse_scale = getattr(mistake_recorder, "copilot_fuse_scale", 1.0)
+            fused = noise_pred + fuse_scale * copilot_out.to(noise_pred.dtype)
+            fused_for_loss = fused[:, :, 1:] if "first_frame_latents" in inputs else fused
+            fused_loss = torch.nn.functional.mse_loss(
+                fused_for_loss.float(), training_target_for_loss.float()
+            )
+            fused_loss = fused_loss * pipe.scheduler.training_weight(timestep)
+            mistake_recorder.last_dit_only_loss = loss.detach()
+            return fused_loss
+
     return loss
 
 

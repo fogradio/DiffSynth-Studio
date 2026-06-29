@@ -83,14 +83,31 @@ class InMemoryCopilotTrainer:
          into the total loss for a single ``accelerator.backward`` pass.
     """
 
-    def __init__(self, copilot_module: torch.nn.Module, copilot_version: str = "v2", gap_sampler=None):
+    def __init__(
+        self,
+        copilot_module: torch.nn.Module,
+        copilot_version: str = "v2",
+        gap_sampler=None,
+        fuse_copilot_into_loss: bool = False,
+        copilot_fuse_scale: float = 1.0,
+    ):
         self.copilot = copilot_module
         self.copilot_version = copilot_version
         self.last_loss: torch.Tensor | None = None
+        # Raw copilot prediction (grad -> copilot params; DiT-detached inputs).
+        # Consumed by FlowMatchSFTMistakeForcingLoss when fusing into the DiT loss.
+        self.last_copilot_output: torch.Tensor | None = None
+        # DiT-only MSE kept for logging when fused mode replaces the return value.
+        self.last_dit_only_loss: torch.Tensor | None = None
         self.gap_sampler = gap_sampler
+        # Read by the loss fn via getattr() to switch on the fused objective.
+        self.fuse_copilot_into_loss = bool(fuse_copilot_into_loss)
+        self.copilot_fuse_scale = float(copilot_fuse_scale)
 
     def reset(self) -> None:
         self.last_loss = None
+        self.last_copilot_output = None
+        self.last_dit_only_loss = None
 
     def write(self, payload: dict, metadata: dict):
         clean_prediction = payload["clean_prediction"].detach()
@@ -112,6 +129,7 @@ class InMemoryCopilotTrainer:
                 clean_prediction, time_embedding, condition_embedding, hidden_input
             )
 
+        self.last_copilot_output = pred
         self.last_loss = torch.nn.functional.mse_loss(
             pred.float(), velocity_residual.float()
         )
@@ -140,6 +158,8 @@ class JointWanCopilotModule(WanTrainingModule):
         copilot_mlp_ratio: float = 4.0,
         copilot_lr: float = 1e-4,
         copilot_loss_weight: float = 1.0,
+        fuse_copilot_into_loss: bool = False,
+        copilot_fuse_scale: float = 1.0,
         copilot_use_gradient_checkpointing: bool = False,
         copilot_resume: str | None = None,
         copilot_n_selected_layers: int = 4,
@@ -198,6 +218,8 @@ class JointWanCopilotModule(WanTrainingModule):
         self.copilot = copilot
         self.copilot_lr = float(copilot_lr)
         self.copilot_loss_weight = float(copilot_loss_weight)
+        self._fuse_copilot_into_loss = bool(fuse_copilot_into_loss)
+        self._copilot_fuse_scale = float(copilot_fuse_scale)
         self._copilot_param_count = count_params(copilot)
 
         self._gap_sampler = None
@@ -216,7 +238,11 @@ class JointWanCopilotModule(WanTrainingModule):
             )
 
         self._copilot_trainer = InMemoryCopilotTrainer(
-            self.copilot, copilot_version=copilot_version, gap_sampler=self._gap_sampler
+            self.copilot,
+            copilot_version=copilot_version,
+            gap_sampler=self._gap_sampler,
+            fuse_copilot_into_loss=self._fuse_copilot_into_loss,
+            copilot_fuse_scale=self._copilot_fuse_scale,
         )
         self.last_dit_loss: torch.Tensor | None = None
         self.last_copilot_loss: torch.Tensor | None = None
@@ -257,16 +283,33 @@ class JointWanCopilotModule(WanTrainingModule):
     # -- joint loss ------------------------------------------------------------
     def forward(self, data, inputs=None):
         self._copilot_trainer.reset()
-        dit_loss = super().forward(data, inputs=inputs)
+        loss = super().forward(data, inputs=inputs)
         copilot_loss = self._copilot_trainer.last_loss
 
-        self.last_dit_loss = dit_loss.detach() if torch.is_tensor(dit_loss) else None
+        if self._fuse_copilot_into_loss:
+            # In fused mode the loss fn already returned
+            #   MSE(noise_pred + scale * copilot_out, training_target),
+            # which updates BOTH the base DiT (via noise_pred) and the copilot
+            # (via copilot_out). We ALSO keep the original standalone copilot
+            # residual MSE term so the copilot retains its direct supervision;
+            # that extra term only adds gradient to the copilot (its target,
+            # velocity_residual, is detached and contains no DiT graph).
+            dit_only = self._copilot_trainer.last_dit_only_loss
+            self.last_dit_loss = dit_only if torch.is_tensor(dit_only) else None
+            self.last_copilot_loss = (
+                copilot_loss.detach() if torch.is_tensor(copilot_loss) else None
+            )
+            if copilot_loss is None:
+                return loss
+            return loss + self.copilot_loss_weight * copilot_loss
+
+        self.last_dit_loss = loss.detach() if torch.is_tensor(loss) else None
         self.last_copilot_loss = (
             copilot_loss.detach() if torch.is_tensor(copilot_loss) else None
         )
         if copilot_loss is None:
-            return dit_loss
-        return dit_loss + self.copilot_loss_weight * copilot_loss
+            return loss
+        return loss + self.copilot_loss_weight * copilot_loss
 
 
 def save_copilot_checkpoint(accelerator, model, output_path, file_name):
@@ -391,6 +434,23 @@ def launch_joint_training(accelerator, dataset, model, model_logger, args):
                                     )
                                     + "\n"
                                 )
+                            # Push the per-component losses to every enabled
+                            # logger (wandb / tensorboard / swanlab share the
+                            # same .log(key, value, step) API). ModelLogger
+                            # already logged the total as "loss"; here we add the
+                            # breakdown the joint/fused objective cares about.
+                            for _logger in model_logger.loggers:
+                                _logger.log("total_loss", total_val, current_step)
+                                if dit_loss is not None:
+                                    _logger.log("dit_loss", dit_val, current_step)
+                                if copilot_loss is not None:
+                                    _logger.log("copilot_loss", cop_val, current_step)
+                                if runtime_model._gap_sampler is not None:
+                                    _logger.log(
+                                        "ogs_entropy",
+                                        runtime_model._gap_sampler.distribution_entropy(),
+                                        current_step,
+                                    )
                             pbar.set_postfix(
                                 total=f"{total_val:.4f}",
                                 dit=f"{dit_val:.4f}",
@@ -483,6 +543,31 @@ def joint_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Weight on the copilot MSE in the total loss. Copilot inputs are "
         "always detached, so this only scales copilot-side gradients.",
+    )
+    parser.add_argument(
+        "--fuse_copilot_into_dit_loss",
+        action="store_true",
+        default=False,
+        help="New mode (default off): add a fused term "
+        "MSE(noise_pred + copilot_fuse_scale * copilot_out, training_target) that "
+        "supervises the SUM of base DiT output and copilot output, on TOP of the "
+        "original standalone copilot residual MSE (still weighted by "
+        "--copilot_loss_weight). Total = fused_term + copilot_loss_weight * "
+        "copilot_residual_MSE. The fused term updates BOTH the base DiT (via "
+        "noise_pred) and the copilot (via copilot_out); the residual term adds "
+        "extra gradient to the copilot only. Copilot inputs stay detached, so "
+        "copilot gradients never leak into the DiT (the DiT is updated only via "
+        "the direct residual connection), mirroring the inference-time fusion. "
+        "When off, the original loss (separate DiT MSE + detached copilot MSE) "
+        "is used.",
+    )
+    parser.add_argument(
+        "--copilot_fuse_scale",
+        type=float,
+        default=1.0,
+        help="Scale on the copilot residual when fusing into the DiT loss "
+        "(analogous to inference --copilot_scale). Only used with "
+        "--fuse_copilot_into_dit_loss.",
     )
     parser.add_argument(
         "--copilot_use_gradient_checkpointing", action="store_true"
@@ -658,6 +743,8 @@ def main():
         copilot_mlp_ratio=args.copilot_mlp_ratio,
         copilot_lr=args.copilot_lr,
         copilot_loss_weight=args.copilot_loss_weight,
+        fuse_copilot_into_loss=args.fuse_copilot_into_dit_loss,
+        copilot_fuse_scale=args.copilot_fuse_scale,
         copilot_use_gradient_checkpointing=args.copilot_use_gradient_checkpointing,
         copilot_resume=args.copilot_resume,
         copilot_n_selected_layers=args.copilot_n_selected_layers,
@@ -676,6 +763,8 @@ def main():
             f"{model._copilot_param_count / 1e6:.2f}M | "
             f"copilot_lr={args.copilot_lr} | "
             f"copilot_loss_weight={args.copilot_loss_weight} | "
+            f"fuse_into_dit_loss={args.fuse_copilot_into_dit_loss} | "
+            f"copilot_fuse_scale={args.copilot_fuse_scale} | "
             f"optimal_gap_sampling={args.optimal_gap_sampling} | "
             f"dataset_size={len(dataset)}"
         )
