@@ -45,11 +45,21 @@ try:
         OmniWorldFrameSequenceOperator,
         OmniWorldManifestDataset,
     )
+    from .wisa_dataset import (
+        WISAManifestDataset,
+        WISAVideoOperator,
+        build_video_index,
+    )
     from .train import WanTrainingModule, wan_parser
 except ImportError:
     from mistake_forcing import (  # type: ignore
         OmniWorldFrameSequenceOperator,
         OmniWorldManifestDataset,
+    )
+    from wisa_dataset import (  # type: ignore
+        WISAManifestDataset,
+        WISAVideoOperator,
+        build_video_index,
     )
     from train import WanTrainingModule, wan_parser  # type: ignore
 
@@ -522,6 +532,27 @@ def joint_parser() -> argparse.ArgumentParser:
                         help="Exponent for the copilot-gap term.")
     parser.add_argument("--ogs_floor_ema_decay", type=float, default=0.999,
                         help="EMA decay for the floor estimate (soft-min of copilot loss).")
+    # --- WISA-80K T2V dataset ---
+    parser.add_argument(
+        "--wisa_manifest_format",
+        action="store_true",
+        default=False,
+        help="Use the WISA-80K jsonl+mp4 dataset (captions+phys_law prompt, "
+             "dynamic 4k+1 frames capped at --num_frames, full-span sparse sampling).",
+    )
+    parser.add_argument(
+        "--wisa_video_root",
+        type=str,
+        default=None,
+        help="Root dir holding WISA shard subdirs (0..127) of <sha256>.mp4 files.",
+    )
+    parser.add_argument(
+        "--wisa_prompt_level",
+        type=str,
+        default="B",
+        choices=["A", "B", "C"],
+        help="Prompt: A=captions, B=+phys_law (default), C=+qualitative phenomena.",
+    )
     return parser
 
 
@@ -536,10 +567,14 @@ def main():
             "Joint copilot training requires --task sft:mistake_forcing, "
             f"got {args.task!r}."
         )
-    if not args.omniworld_manifest_format:
+    if not (args.wisa_manifest_format or args.omniworld_manifest_format):
         raise ValueError(
-            "Joint copilot training currently only supports "
+            "Joint copilot training requires --wisa_manifest_format or "
             "--omniworld_manifest_format."
+        )
+    if args.wisa_manifest_format and args.omniworld_manifest_format:
+        raise ValueError(
+            "--wisa_manifest_format and --omniworld_manifest_format are mutually exclusive."
         )
 
     accelerator = accelerate.Accelerator(
@@ -558,16 +593,33 @@ def main():
         data_file_keys=tuple(),
         max_data_items=args.max_data_items,
     )
-    dataset = OmniWorldManifestDataset(
-        raw_dataset,
-        OmniWorldFrameSequenceOperator(
-            base_path=args.dataset_base_path,
-            frame_processor=ImageCropAndResize(
-                args.height, args.width, args.max_pixels, 16, 16
+    if args.wisa_manifest_format:
+        if args.wisa_video_root is None:
+            raise ValueError(
+                "--wisa_video_root is required with --wisa_manifest_format."
+            )
+        dataset = WISAManifestDataset(
+            raw_dataset,
+            WISAVideoOperator(
+                name2path=build_video_index(args.wisa_video_root),
+                frame_processor=ImageCropAndResize(
+                    args.height, args.width, args.max_pixels, 16, 16
+                ),
+                max_frames=args.num_frames,
+                prompt_level=args.wisa_prompt_level,
             ),
-            num_frames=args.num_frames,
-        ),
-    )
+        )
+    else:
+        dataset = OmniWorldManifestDataset(
+            raw_dataset,
+            OmniWorldFrameSequenceOperator(
+                base_path=args.dataset_base_path,
+                frame_processor=ImageCropAndResize(
+                    args.height, args.width, args.max_pixels, 16, 16
+                ),
+                num_frames=args.num_frames,
+            ),
+        )
 
     model = JointWanCopilotModule(
         model_paths=args.model_paths,
