@@ -6,7 +6,9 @@ with the DiT's time embedding, condition embedding and hidden-state mean, and
 outputs a velocity residual.  Adding this residual back yields a corrected
 velocity that is then used in the standard flow-matching ODE step.
 
-Supports both copilot v1 (VideoCopilotDecoder) and v2 (VideoCopilotDecoderV2).
+Supports copilot v1 (VideoCopilotDecoder), v2 (VideoCopilotDecoderV2) and v3
+(VideoCopilotDecoderV3).  v1/v2 consume the layer-averaged hidden mean; v3
+consumes the four selected DiT hidden states fed through its cross-attention.
 """
 from __future__ import annotations
 
@@ -78,6 +80,12 @@ def load_copilot_model(
     elif variant == "v2":
         from model_v2 import VideoCopilotDecoderV2 as CopilotCls
         # Default depth matches video_copilot/model_v2.py (Wan-style AdaLN, depth=10).
+        defaults = dict(dim=1024, depth=10, num_heads=16, mlp_ratio=4.0)
+    elif variant == "v3":
+        from model_v3 import VideoCopilotDecoderV3 as CopilotCls
+        # Same Wan-style AdaLN trunk as v2 (depth=10); the memory side fuses the
+        # four selected DiT hidden states. n_selected_layers/selected_hidden_dim
+        # fall back to the model's own defaults (4 / 1536), matching training.
         defaults = dict(dim=1024, depth=10, num_heads=16, mlp_ratio=4.0)
     else:
         raise ValueError(f"Unknown copilot variant: {variant}")
@@ -163,8 +171,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0)
 
     # ---- copilot ----
-    p.add_argument("--copilot_variant", type=str, default="v2", choices=["v1", "v2"],
-                    help="Copilot model architecture variant.")
+    p.add_argument("--copilot_variant", type=str, default="v2", choices=["v1", "v2", "v3"],
+                    help="Copilot model architecture variant (v3 consumes the selected DiT hidden states).")
     p.add_argument("--copilot_ckpt", type=str,
                     default=str(MISTAKE_FORCING_DIR / "outputs" / "video_copilot_v2" / "epoch-17" / "model.safetensors"),
                     help="Path to copilot model weights (safetensors or pt).")
@@ -254,6 +262,7 @@ def generate_with_copilot(
     cfg_scale: float,
     sigma_shift: float,
     seed: int,
+    copilot_variant: str = "v2",
     copilot_scale: float = 1.0,
     copilot_start_pct: float = 0.0,
     copilot_end_pct: float = 1.0,
@@ -363,8 +372,18 @@ def generate_with_copilot(
             # Extract captured states from the positive forward pass
             capture_payload = capture.finalize()
             time_embedding = capture_payload["time_embedding"]   # (B, dim)
-            hidden_mean = capture_payload["hidden_mean"]         # (B, N, dim)
             condition_embedding = inputs_posi["context"]         # (B, S, text_dim)
+
+            # v3 fuses the four selected DiT hidden states; v1/v2 use the
+            # layer-averaged hidden mean. Match the training-time `write()` path.
+            if copilot_variant == "v3":
+                # finalize() stacks layers on dim 0 -> (L, B, N, D);
+                # v3 expects (B, L, N, D).
+                hidden_input = capture_payload["selected_hidden_states"]
+                if hidden_input.dim() == 4:
+                    hidden_input = hidden_input.permute(1, 0, 2, 3).contiguous()
+            else:
+                hidden_input = capture_payload["hidden_mean"]    # (B, N, dim)
 
             # Run copilot
             copilot_dtype = next(copilot.parameters()).dtype
@@ -372,7 +391,7 @@ def generate_with_copilot(
                 clean_prediction.to(copilot_dtype),
                 time_embedding.to(copilot_dtype),
                 condition_embedding.to(copilot_dtype),
-                hidden_mean.to(copilot_dtype),
+                hidden_input.to(copilot_dtype),
             )
             # Correct positive velocity
             noise_pred_posi = (
@@ -504,6 +523,7 @@ def main() -> None:
             cfg_scale=args.cfg_scale,
             sigma_shift=args.sigma_shift,
             seed=seed,
+            copilot_variant=args.copilot_variant,
             copilot_scale=args.copilot_scale,
             copilot_start_pct=args.copilot_start_pct,
             copilot_end_pct=args.copilot_end_pct,
