@@ -46,6 +46,10 @@ WIDTH="${WIDTH:-832}"
 # NUM_FRAMES is the CAP (max frames), not a fixed length. Each clip uses
 # align_4k1(min(NUM_FRAMES, total_frames)); no padding.
 NUM_FRAMES="${NUM_FRAMES:-81}"
+# Per-GPU batch size. NOTE: batch_size>1 forces FIXED-frame sampling (the WISA
+# operator cannot batch variable-length clips), overriding the DYNAMIC per-clip
+# num_frames noted in the header — every clip then uses align_4k1(NUM_FRAMES).
+BATCH_SIZE="${BATCH_SIZE:-6}"
 DATASET_REPEAT="${DATASET_REPEAT:-1}"
 DATASET_NUM_WORKERS="${DATASET_NUM_WORKERS:-4}"
 NUM_EPOCHS="${NUM_EPOCHS:-5}"
@@ -79,6 +83,20 @@ COPILOT_RESUME="${COPILOT_RESUME:-}"
 # Tip: set COPILOT_RESUME to warm-start from a trained copilot.
 FUSE_COPILOT_INTO_DIT_LOSS="${FUSE_COPILOT_INTO_DIT_LOSS:-0}"
 COPILOT_FUSE_SCALE="${COPILOT_FUSE_SCALE:-1.0}"
+
+# ===== Auxiliary-head: copilot gradient INTO the DiT (new mode, default off) =====
+# When COPILOT_GRAD_TO_DIT=1, the copilot stops being a detached side head and
+# becomes a deep-supervision head: its MSE gradient flows back into the DiT
+# through the captured mid-layer hidden states (hidden_mean for v2 /
+# selected_hidden_states for v3) and the time embedding. The target
+# (velocity_residual), clean_prediction and the frozen T5 context stay detached.
+# Mutually exclusive with FUSE_COPILOT_INTO_DIT_LOSS. When 0, the copilot stays a
+# pure side head and no gradient reaches the DiT.
+COPILOT_GRAD_TO_DIT="${COPILOT_GRAD_TO_DIT:-1}"
+if [[ "${FUSE_COPILOT_INTO_DIT_LOSS}" == "1" && "${COPILOT_GRAD_TO_DIT}" == "1" ]]; then
+  echo "[fatal] FUSE_COPILOT_INTO_DIT_LOSS and COPILOT_GRAD_TO_DIT are mutually exclusive; set at most one to 1." >&2
+  exit 1
+fi
 
 # Optional cap; leave unset to use all 1000 balanced_1k items.
 MAX_DATA_ITEMS="${MAX_DATA_ITEMS:-}"
@@ -136,6 +154,9 @@ if [[ "${FUSE_COPILOT_INTO_DIT_LOSS}" == "1" ]]; then
   EXTRA_ARGS+=(--fuse_copilot_into_dit_loss)
   EXTRA_ARGS+=(--copilot_fuse_scale "${COPILOT_FUSE_SCALE}")
 fi
+if [[ "${COPILOT_GRAD_TO_DIT}" == "1" ]]; then
+  EXTRA_ARGS+=(--copilot_grad_to_dit)
+fi
 if [[ -n "${RESUME_FROM_CHECKPOINT:-}" ]]; then
   EXTRA_ARGS+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
@@ -159,6 +180,7 @@ fi
   --height "${HEIGHT}" \
   --width "${WIDTH}" \
   --num_frames "${NUM_FRAMES}" \
+  --batch_size "${BATCH_SIZE}" \
   --dataset_repeat "${DATASET_REPEAT}" \
   --dataset_num_workers "${DATASET_NUM_WORKERS}" \
   --model_paths "[\"${MODEL_ROOT}/diffusion_pytorch_model.safetensors\",\"${MODEL_ROOT}/models_t5_umt5-xxl-enc-bf16.pth\",\"${MODEL_ROOT}/Wan2.1_VAE.pth\"]" \

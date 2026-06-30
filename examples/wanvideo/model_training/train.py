@@ -135,7 +135,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         if self.task == "sft:mistake_forcing":
-            inputs_shared["mistake_capture"] = WanHiddenStateCapture(self.mistake_selected_layers)
+            inputs_shared["mistake_capture"] = WanHiddenStateCapture(
+                self.mistake_selected_layers,
+                detach=getattr(self, "_capture_detach_hidden", True),
+            )
             inputs_shared["mistake_metadata"] = {
                 "sample_id": data.get("sample_id"),
                 "scene_id": data.get("scene_id"),
