@@ -68,19 +68,24 @@ class OmniWorldManifestDataset(torch.utils.data.Dataset):
 
 
 class WanHiddenStateCapture:
-    def __init__(self, selected_layers=(3, 11, 19, 29)):
+    def __init__(self, selected_layers=(3, 11, 19, 29), detach=True):
         self.selected_layers = tuple(selected_layers)
         self.hidden_sum = None
         self.hidden_count = 0
         self.selected_hidden_states = {}
         self.time_embedding = None
         self.hidden_dtype = None
+        # When False, captured hidden states / time embedding keep their grad_fn
+        # so an auxiliary head (copilot) can backprop into the DiT backbone.
+        # Default True preserves the original detached-dump behaviour.
+        self.detach = detach
 
     def set_time_embedding(self, time_embedding):
-        self.time_embedding = time_embedding.detach()
+        self.time_embedding = time_embedding.detach() if self.detach else time_embedding
 
     def add(self, layer_index, hidden_states):
-        hidden_states = hidden_states.detach()
+        if self.detach:
+            hidden_states = hidden_states.detach()
         if self.hidden_dtype is None:
             self.hidden_dtype = hidden_states.dtype
         if self.hidden_sum is None:

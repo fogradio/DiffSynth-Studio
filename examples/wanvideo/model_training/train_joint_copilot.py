@@ -92,6 +92,7 @@ class InMemoryCopilotTrainer:
         gap_sampler=None,
         fuse_copilot_into_loss: bool = False,
         copilot_fuse_scale: float = 1.0,
+        grad_to_dit: bool = False,
     ):
         self.copilot = copilot_module
         self.copilot_version = copilot_version
@@ -105,6 +106,10 @@ class InMemoryCopilotTrainer:
         # Read by the loss fn via getattr() to switch on the fused objective.
         self.fuse_copilot_into_loss = bool(fuse_copilot_into_loss)
         self.copilot_fuse_scale = float(copilot_fuse_scale)
+        # Auxiliary-head mode: when True, hidden states + time embedding are NOT
+        # detached in write(), so the copilot MSE backprops into the DiT. Must be
+        # paired with WanHiddenStateCapture(detach=False) upstream.
+        self.grad_to_dit = bool(grad_to_dit)
 
     def reset(self) -> None:
         self.last_loss = None
@@ -112,14 +117,31 @@ class InMemoryCopilotTrainer:
         self.last_dit_only_loss = None
 
     def write(self, payload: dict, metadata: dict):
+        # clean_prediction is a final-output derivative; keep it detached so the
+        # auxiliary-head gradient enters the DiT through mid-layer hidden states,
+        # not via a second output-side path.
         clean_prediction = payload["clean_prediction"].detach()
+        # Target stays fixed (detached) even in auxiliary-head mode.
         velocity_residual = payload["velocity_residual"].detach()
-        time_embedding = payload["time_embedding"].detach()
+        # Frozen T5 context: detach either way.
         condition_embedding = payload["condition_embedding"].detach()
+        # hidden states + time embedding carry the copilot->DiT gradient when
+        # grad_to_dit is on. Their capture was left non-detached upstream
+        # (WanHiddenStateCapture.detach=False), so NOT detaching here lets the
+        # copilot MSE backprop into the DiT backbone (deep supervision). When off,
+        # detach here to reproduce the original detached side-head behaviour.
+        keep = self.grad_to_dit
+        time_embedding = (
+            payload["time_embedding"] if keep else payload["time_embedding"].detach()
+        )
 
         if self.copilot_version == "v3":
             # selected_hidden_states from capture: (L, B, N, D) → v3 expects (B, L, N, D)
-            shs = payload["selected_hidden_states"].detach()
+            shs = (
+                payload["selected_hidden_states"]
+                if keep
+                else payload["selected_hidden_states"].detach()
+            )
             if shs.dim() == 4:
                 # Always transpose by contract; comparing axis sizes fails when
                 # batch size happens to equal the number of selected layers.
@@ -128,7 +150,9 @@ class InMemoryCopilotTrainer:
                 clean_prediction, time_embedding, condition_embedding, shs
             )
         else:
-            hidden_input = payload["hidden_mean"].detach()
+            hidden_input = (
+                payload["hidden_mean"] if keep else payload["hidden_mean"].detach()
+            )
             pred = self.copilot(
                 clean_prediction, time_embedding, condition_embedding, hidden_input
             )
@@ -164,6 +188,7 @@ class JointWanCopilotModule(WanTrainingModule):
         copilot_loss_weight: float = 1.0,
         fuse_copilot_into_loss: bool = False,
         copilot_fuse_scale: float = 1.0,
+        copilot_grad_to_dit: bool = False,
         copilot_use_gradient_checkpointing: bool = False,
         copilot_resume: str | None = None,
         copilot_n_selected_layers: int = 4,
@@ -224,6 +249,18 @@ class JointWanCopilotModule(WanTrainingModule):
         self.copilot_loss_weight = float(copilot_loss_weight)
         self._fuse_copilot_into_loss = bool(fuse_copilot_into_loss)
         self._copilot_fuse_scale = float(copilot_fuse_scale)
+        self._copilot_grad_to_dit = bool(copilot_grad_to_dit)
+        if self._copilot_grad_to_dit and self._fuse_copilot_into_loss:
+            raise ValueError(
+                "copilot_grad_to_dit and fuse_copilot_into_dit_loss are mutually "
+                "exclusive: both route copilot influence into the DiT but with "
+                "different (conflicting) gradient semantics. Enable at most one."
+            )
+        # Controls WanHiddenStateCapture(detach=...) in BOTH the single-forward
+        # (train.py:get_pipeline_inputs) and batched-forward (_forward_batched)
+        # paths. Off => detached side head; on => copilot MSE backprops into the
+        # DiT through the captured mid-layer hidden states (deep supervision).
+        self._capture_detach_hidden = not self._copilot_grad_to_dit
         self._copilot_param_count = count_params(copilot)
 
         self._gap_sampler = None
@@ -247,6 +284,7 @@ class JointWanCopilotModule(WanTrainingModule):
             gap_sampler=self._gap_sampler,
             fuse_copilot_into_loss=self._fuse_copilot_into_loss,
             copilot_fuse_scale=self._copilot_fuse_scale,
+            grad_to_dit=self._copilot_grad_to_dit,
         )
         self.last_dit_loss: torch.Tensor | None = None
         self.last_copilot_loss: torch.Tensor | None = None
@@ -350,7 +388,9 @@ class JointWanCopilotModule(WanTrainingModule):
         # One capture for the whole batch: the single batched DiT forward
         # accumulates [B, N, D] hidden states, so finalize() yields batched
         # payloads the copilot head consumes in one shot.
-        shared["mistake_capture"] = WanHiddenStateCapture(self.mistake_selected_layers)
+        shared["mistake_capture"] = WanHiddenStateCapture(
+            self.mistake_selected_layers, detach=self._capture_detach_hidden
+        )
         if "mistake_metadata" in shared:
             meta = dict(shared["mistake_metadata"])
             meta["sample_id"] = sample_ids
@@ -653,6 +693,18 @@ def joint_parser() -> argparse.ArgumentParser:
         "--fuse_copilot_into_dit_loss.",
     )
     parser.add_argument(
+        "--copilot_grad_to_dit",
+        action="store_true",
+        default=False,
+        help="Auxiliary-head mode (default off): let the copilot MSE gradient "
+        "flow back into the DiT through the captured mid-layer hidden states "
+        "(hidden_mean for v2 / selected_hidden_states for v3) and the time "
+        "embedding, turning the copilot into a deep-supervision head. The target "
+        "(velocity_residual), clean_prediction and the frozen T5 context stay "
+        "detached. Mutually exclusive with --fuse_copilot_into_dit_loss. Off => "
+        "copilot stays a detached side head (no gradient reaches the DiT).",
+    )
+    parser.add_argument(
         "--copilot_use_gradient_checkpointing", action="store_true"
     )
     parser.add_argument("--copilot_resume", type=str, default=None)
@@ -837,6 +889,7 @@ def main():
         copilot_loss_weight=args.copilot_loss_weight,
         fuse_copilot_into_loss=args.fuse_copilot_into_dit_loss,
         copilot_fuse_scale=args.copilot_fuse_scale,
+        copilot_grad_to_dit=args.copilot_grad_to_dit,
         copilot_use_gradient_checkpointing=args.copilot_use_gradient_checkpointing,
         copilot_resume=args.copilot_resume,
         copilot_n_selected_layers=args.copilot_n_selected_layers,
@@ -857,6 +910,7 @@ def main():
             f"copilot_loss_weight={args.copilot_loss_weight} | "
             f"fuse_into_dit_loss={args.fuse_copilot_into_dit_loss} | "
             f"copilot_fuse_scale={args.copilot_fuse_scale} | "
+            f"grad_to_dit={args.copilot_grad_to_dit} | "
             f"optimal_gap_sampling={args.optimal_gap_sampling} | "
             f"dataset_size={len(dataset)}"
         )
