@@ -23,12 +23,12 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 PROMPTS_PATH="${WAN21_INFER_PROMPTS:-/projects_vol/gp_chuanxia.zheng/hwzhang/datasets/WISA-80K/data/sample_videos_10/sample_10.jsonl}"
 BASE_MODEL_ROOT="${WAN21_T2V_13B_MODEL_ROOT:-/projects_vol/gp_chuanxia.zheng/hwzhang/model/Wan2.1-T2V-1.3B}"
 #DIT_WEIGHTS="${WAN21_INFER_DIT_WEIGHTS:-/projects_vol/gp_chuanxia.zheng/hwzhang/model/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors}"
-DIT_WEIGHTS="${WAN21_INFER_DIT_WEIGHTS:-/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/outputs/wan21_t2v_1_3b_wisa_joint_copilot_20260629_200122/step-2500.safetensors}"
+DIT_WEIGHTS="${WAN21_INFER_DIT_WEIGHTS:-/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/outputs/wan21_t2v_1_3b_wisa_joint_copilot_v2/step-2500.safetensors}"
 
 # ---- Copilot ----
 COPILOT_VARIANT="${COPILOT_VARIANT:-v2}"
 if [ "${COPILOT_VARIANT}" = "v2" ]; then
-    COPILOT_CKPT_DEFAULT="/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/outputs/wan21_t2v_1_3b_wisa_joint_copilot_20260629_200122/copilot_final.pt"
+    COPILOT_CKPT_DEFAULT="/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/outputs/wan21_t2v_1_3b_wisa_joint_copilot_v2/copilot_final.pt"
 else
     COPILOT_CKPT_DEFAULT="/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/outputs/wan21_t2v_1_3b_wisa_joint_copilot_1gpu_20260629_143421/copilot_final.pt"
 fi
@@ -36,6 +36,10 @@ COPILOT_CKPT="${COPILOT_CKPT:-${COPILOT_CKPT_DEFAULT}}"
 COPILOT_SCALE="${COPILOT_SCALE:-1.0}"
 COPILOT_START_PCT="${COPILOT_START_PCT:-0.0}"
 COPILOT_END_PCT="${COPILOT_END_PCT:-1.0}"
+# Also correct the negative/CFG branch (v_nega += copilot). Default off (0).
+# When 1, cancels the shared-weight "hollowing" on the negative branch too,
+# removing the (cfg-1)*c' over-shoot for fused-trained DiTs.
+COPILOT_CORRECT_NEGATIVE="${COPILOT_CORRECT_NEGATIVE:-1}"
 
 # ---- Output ----
 OUTPUT_ROOT="${WAN21_INFER_OUTPUT_ROOT:-/projects_vol/gp_chuanxia.zheng/hwzhang/code/mistake_forcing/outputs/inference}"
@@ -51,6 +55,11 @@ SIGMA_SHIFT="${WAN21_INFER_SIGMA_SHIFT:-5.0}"
 SEED="${WAN21_INFER_SEED:-0}"
 FPS="${WAN21_INFER_FPS:-16}"
 LIMIT="${WAN21_INFER_LIMIT:-0}"
+
+EXTRA_ARGS=()
+if [ "${COPILOT_CORRECT_NEGATIVE}" = "1" ]; then
+  EXTRA_ARGS+=(--copilot_correct_negative)
+fi
 
 "${PYTHON_BIN}" examples/wanvideo/model_inference/Wan2.1-T2V-1.3B-OmniWorld-CopilotInference.py \
   --prompts_path "${PROMPTS_PATH}" \
@@ -72,4 +81,5 @@ LIMIT="${WAN21_INFER_LIMIT:-0}"
   --copilot_scale "${COPILOT_SCALE}" \
   --copilot_start_pct "${COPILOT_START_PCT}" \
   --copilot_end_pct "${COPILOT_END_PCT}" \
+  "${EXTRA_ARGS[@]}" \
   "$@"

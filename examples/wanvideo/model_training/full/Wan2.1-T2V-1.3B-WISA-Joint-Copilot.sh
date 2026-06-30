@@ -77,7 +77,7 @@ COPILOT_RESUME="${COPILOT_RESUME:-}"
 # gradient to the copilot only. When 0, the original loss (separate DiT MSE
 # + detached copilot MSE) is used.
 # Tip: set COPILOT_RESUME to warm-start from a trained copilot.
-FUSE_COPILOT_INTO_DIT_LOSS="${FUSE_COPILOT_INTO_DIT_LOSS:-1}"
+FUSE_COPILOT_INTO_DIT_LOSS="${FUSE_COPILOT_INTO_DIT_LOSS:-0}"
 COPILOT_FUSE_SCALE="${COPILOT_FUSE_SCALE:-1.0}"
 
 # Optional cap; leave unset to use all 1000 balanced_1k items.

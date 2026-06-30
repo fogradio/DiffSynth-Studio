@@ -182,6 +182,11 @@ def parse_args() -> argparse.Namespace:
                     help="Start applying copilot after this fraction of denoising steps (0.0 = from the very start).")
     p.add_argument("--copilot_end_pct", type=float, default=1.0,
                     help="Stop applying copilot after this fraction of denoising steps (1.0 = until the very end).")
+    p.add_argument("--copilot_correct_negative", action="store_true",
+                    help="Also apply the copilot correction to the negative (CFG) branch "
+                    "(v_nega += copilot), so the shared-weight 'hollowing' cancels there "
+                    "too and the (cfg-1)*c' over-shoot is removed. Default off "
+                    "(positive branch only).")
 
     # ---- generation ----
     p.add_argument("--height", type=int, default=480)
@@ -266,6 +271,7 @@ def generate_with_copilot(
     copilot_scale: float = 1.0,
     copilot_start_pct: float = 0.0,
     copilot_end_pct: float = 1.0,
+    copilot_correct_negative: bool = False,
 ) -> list:
     """Run the full Wan2.1 T2V pipeline with copilot correction in the loop.
 
@@ -273,6 +279,11 @@ def generate_with_copilot(
     velocity-residual correction at every (eligible) denoising step.  The
     correction is applied to the *positive* velocity prediction, *before* CFG
     combination, so that it matches the copilot's training distribution.
+
+    When ``copilot_correct_negative`` is set, the same correction is also added
+    to the *negative* (CFG) branch using that branch's own forward-pass states,
+    so a fused-trained DiT's shared-weight "hollowing" cancels on both branches
+    and the (cfg-1)*c' over-shoot is removed.  Default off (positive only).
     """
 
     # 1. Scheduler -------------------------------------------------------
@@ -336,6 +347,46 @@ def generate_with_copilot(
     copilot_end_step = int(copilot_end_pct * total_steps)
 
     # 6. Denoising loop with copilot correction --------------------------
+    copilot_dtype = next(copilot.parameters()).dtype
+
+    def _run_copilot(noise_pred_branch, capture, context_embedding, progress_id):
+        """Add the copilot velocity-residual correction to one branch's
+        prediction, using that branch's OWN forward-pass states. Mirrors the
+        training-time ``write()`` path (clean x0 estimate + captured states).
+        ``context_embedding`` is the branch's text condition: ``inputs_posi``
+        for the positive branch, ``inputs_nega`` for the negative branch."""
+        # Compute the estimated clean prediction (step to sigma=0)
+        clean_prediction = pipe.scheduler.step(
+            noise_pred_branch,
+            pipe.scheduler.timesteps[progress_id],
+            inputs_shared["latents"],
+            to_final=True,
+        )
+        capture_payload = capture.finalize()
+        time_embedding = capture_payload["time_embedding"]   # (B, dim)
+
+        # v3 fuses the four selected DiT hidden states; v1/v2 use the
+        # layer-averaged hidden mean. Match the training-time `write()` path.
+        if copilot_variant == "v3":
+            # finalize() stacks layers on dim 0 -> (L, B, N, D);
+            # v3 expects (B, L, N, D).
+            hidden_input = capture_payload["selected_hidden_states"]
+            if hidden_input.dim() == 4:
+                hidden_input = hidden_input.permute(1, 0, 2, 3).contiguous()
+        else:
+            hidden_input = capture_payload["hidden_mean"]    # (B, N, dim)
+
+        velocity_residual = copilot(
+            clean_prediction.to(copilot_dtype),
+            time_embedding.to(copilot_dtype),
+            context_embedding.to(copilot_dtype),
+            hidden_input.to(copilot_dtype),
+        )
+        return (
+            noise_pred_branch
+            + copilot_scale * velocity_residual.to(noise_pred_branch.dtype)
+        )
+
     for progress_id, timestep in enumerate(tqdm(
             pipe.scheduler.timesteps, desc="Denoising")):
         timestep_t = timestep.unsqueeze(0).to(
@@ -347,12 +398,16 @@ def generate_with_copilot(
             and copilot_start_step <= progress_id < copilot_end_step
         )
 
-        # -- Positive-prompt forward pass --------------------------------
+        # -- Positive-prompt forward pass (+ copilot, before CFG) --------
         if apply_copilot:
-            capture = WanHiddenStateCapture()
+            capture_posi = WanHiddenStateCapture()
             noise_pred_posi = pipe.model_fn(
                 **models, **inputs_shared, **inputs_posi,
-                timestep=timestep_t, mistake_capture=capture,
+                timestep=timestep_t, mistake_capture=capture_posi,
+            )
+            noise_pred_posi = _run_copilot(
+                noise_pred_posi, capture_posi, inputs_posi["context"],
+                progress_id,
             )
         else:
             noise_pred_posi = pipe.model_fn(
@@ -360,51 +415,27 @@ def generate_with_copilot(
                 timestep=timestep_t,
             )
 
-        # -- Copilot correction (before CFG) -----------------------------
-        if apply_copilot:
-            # Compute the estimated clean prediction (step to sigma=0)
-            clean_prediction = pipe.scheduler.step(
-                noise_pred_posi,
-                pipe.scheduler.timesteps[progress_id],
-                inputs_shared["latents"],
-                to_final=True,
-            )
-            # Extract captured states from the positive forward pass
-            capture_payload = capture.finalize()
-            time_embedding = capture_payload["time_embedding"]   # (B, dim)
-            condition_embedding = inputs_posi["context"]         # (B, S, text_dim)
-
-            # v3 fuses the four selected DiT hidden states; v1/v2 use the
-            # layer-averaged hidden mean. Match the training-time `write()` path.
-            if copilot_variant == "v3":
-                # finalize() stacks layers on dim 0 -> (L, B, N, D);
-                # v3 expects (B, L, N, D).
-                hidden_input = capture_payload["selected_hidden_states"]
-                if hidden_input.dim() == 4:
-                    hidden_input = hidden_input.permute(1, 0, 2, 3).contiguous()
-            else:
-                hidden_input = capture_payload["hidden_mean"]    # (B, N, dim)
-
-            # Run copilot
-            copilot_dtype = next(copilot.parameters()).dtype
-            velocity_residual = copilot(
-                clean_prediction.to(copilot_dtype),
-                time_embedding.to(copilot_dtype),
-                condition_embedding.to(copilot_dtype),
-                hidden_input.to(copilot_dtype),
-            )
-            # Correct positive velocity
-            noise_pred_posi = (
-                noise_pred_posi
-                + copilot_scale * velocity_residual.to(noise_pred_posi.dtype)
-            )
-
         # -- CFG ---------------------------------------------------------
         if cfg_scale != 1.0:
-            noise_pred_nega = pipe.model_fn(
-                **models, **inputs_shared, **inputs_nega,
-                timestep=timestep_t,
-            )
+            if apply_copilot and copilot_correct_negative:
+                # Also correct the negative branch with its OWN states, so the
+                # shared-weight "hollowing" cancels here too and the
+                # (cfg-1)*c' over-shoot is removed (see docs/
+                # fuse_copilot_into_dit_loss_degradation_analysis.md).
+                capture_nega = WanHiddenStateCapture()
+                noise_pred_nega = pipe.model_fn(
+                    **models, **inputs_shared, **inputs_nega,
+                    timestep=timestep_t, mistake_capture=capture_nega,
+                )
+                noise_pred_nega = _run_copilot(
+                    noise_pred_nega, capture_nega, inputs_nega["context"],
+                    progress_id,
+                )
+            else:
+                noise_pred_nega = pipe.model_fn(
+                    **models, **inputs_shared, **inputs_nega,
+                    timestep=timestep_t,
+                )
             noise_pred = (
                 noise_pred_nega
                 + cfg_scale * (noise_pred_posi - noise_pred_nega)
@@ -464,6 +495,7 @@ def main() -> None:
     print(f"[info] copilot ckpt:     {args.copilot_ckpt}")
     print(f"[info] copilot scale:    {args.copilot_scale}")
     print(f"[info] copilot range:    [{args.copilot_start_pct:.0%}, {args.copilot_end_pct:.0%})")
+    print(f"[info] correct nega:     {args.copilot_correct_negative}")
     print(f"[info] prompts:          {args.prompts_path} (n={len(prompts)})")
 
     # ---- Load pipeline ----
@@ -496,6 +528,7 @@ def main() -> None:
         "copilot_scale": args.copilot_scale,
         "copilot_start_pct": args.copilot_start_pct,
         "copilot_end_pct": args.copilot_end_pct,
+        "copilot_correct_negative": args.copilot_correct_negative,
         "negative_prompt": args.negative_prompt,
         "num_prompts": len(prompts),
         "items": [],
@@ -527,6 +560,7 @@ def main() -> None:
             copilot_scale=args.copilot_scale,
             copilot_start_pct=args.copilot_start_pct,
             copilot_end_pct=args.copilot_end_pct,
+            copilot_correct_negative=args.copilot_correct_negative,
         )
         save_video(video, str(video_path), fps=args.fps, quality=5)
         print(f"        saved -> {video_path}")
